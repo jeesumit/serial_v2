@@ -1,0 +1,9 @@
+# keep line endings stable on Windows checkouts (tests compare file contents; shell scripts must stay LF)
+* text=auto
+*.bin binary
+*.ico binary
+*.png binary
+*.jpg binary
+samples/** -text
+*.sh text eol=lf
+*.bat text eol=crlf

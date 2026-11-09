@@ -1,0 +1,11 @@
+.venv*/
+node_modules/
+__pycache__/
+.pytest_cache/
+.hypothesis/
+build/
+dist/
+redist/
+version_info.txt
+logs/
+*.pyc

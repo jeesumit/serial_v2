@@ -1,0 +1,139 @@
+name: Test, build and publish Windows installer
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:                         # nothing is built unless every test passes on real Windows (and Linux for pty tests)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - name: Install Python test dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Python tests (backend, security, rotation, serial, packaging)
+        run: python -m pytest tests -q -p no:cacheprovider --junitxml=pytest-${{ matrix.os }}.xml
+      - name: Browser UI tests (real index.html in jsdom)
+        working-directory: tests/js
+        run: |
+          npm ci --no-audit --no-fund
+          node --test
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-report-${{ matrix.os }}
+          path: pytest-${{ matrix.os }}.xml
+
+  build:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Install dependencies
+        run: python -m pip install -r requirements-desktop.txt
+      - name: Build app (PyInstaller)
+        run: pyinstaller --noconfirm serial_monitor.spec
+      - name: Self-test packaged exe (headless)
+        shell: pwsh
+        run: |
+          $p = Start-Process dist\SerialMonitor\SerialMonitor.exe -ArgumentList '--selftest','--data-dir',"$env:RUNNER_TEMP\smtest" -Wait -PassThru
+          Get-Content "$env:RUNNER_TEMP\smtest\selftest.txt"
+          if ($p.ExitCode -ne 0) { throw "selftest failed ($($p.ExitCode))" }
+      - name: Self-test with a corporate proxy configured (must be ignored for loopback)
+        shell: pwsh
+        env: { HTTP_PROXY: 'http://127.0.0.1:9', HTTPS_PROXY: 'http://127.0.0.1:9', NO_PROXY: '' }
+        run: |
+          $p = Start-Process dist\SerialMonitor\SerialMonitor.exe -ArgumentList '--selftest','--data-dir',"$env:RUNNER_TEMP\smproxy" -Wait -PassThru
+          Get-Content "$env:RUNNER_TEMP\smproxy\selftest.txt"
+          if ($p.ExitCode -ne 0) { throw "proxy selftest failed ($($p.ExitCode))" }
+      - name: GUI smoke test (real native window via WebView2) - advisory on first runs
+        id: gui
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $p = Start-Process dist\SerialMonitor\SerialMonitor.exe -ArgumentList '--gui-selftest','--data-dir',"$env:RUNNER_TEMP\smgui" -Wait -PassThru
+          if (Test-Path "$env:RUNNER_TEMP\smgui\gui_selftest.txt") { Get-Content "$env:RUNNER_TEMP\smgui\gui_selftest.txt" }
+          if (Test-Path "$env:RUNNER_TEMP\smgui\app.log") { Get-Content "$env:RUNNER_TEMP\smgui\app.log" }
+          if ($p.ExitCode -ne 0) { throw "GUI smoke test failed ($($p.ExitCode))" }
+      - name: Fetch WebView2 bootstrapper
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force redist | Out-Null
+          Invoke-WebRequest https://go.microsoft.com/fwlink/p/?LinkId=2124703 -OutFile redist\MicrosoftEdgeWebview2Setup.exe
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $v = (Get-Content VERSION).Trim()
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc "/DAppVersion=$v" installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed (exit $LASTEXITCODE)" }
+          Compress-Archive -Force dist\SerialMonitor "dist\SerialMonitor-$v-portable.zip"
+      - name: Installer lifecycle test (silent install -> run -> uninstall)
+        shell: pwsh
+        run: |
+          $v = (Get-Content VERSION).Trim()
+          $inst = "dist\SerialMonitor-Setup-$v.exe"
+          if (-not (Test-Path $inst)) { throw 'Installer .exe was NOT created' }
+          $dir = "$env:RUNNER_TEMP\sminstall"
+          $p = Start-Process $inst -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER',"/DIR=$dir","/LOG=$env:RUNNER_TEMP\inst.log" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content "$env:RUNNER_TEMP\inst.log" -Tail 40; throw "installer exit code $($p.ExitCode)" }
+          if (-not (Test-Path "$dir\SerialMonitor.exe")) { throw 'exe missing after install' }
+          $info = (Get-Item "$dir\SerialMonitor.exe").VersionInfo
+          if ($info.ProductVersion -ne $v) { throw "version resource is '$($info.ProductVersion)', expected '$v'" }
+          $t = Start-Process "$dir\SerialMonitor.exe" -ArgumentList '--selftest','--data-dir',"$env:RUNNER_TEMP\smi" -Wait -PassThru
+          if ($t.ExitCode -ne 0) { throw 'installed app selftest failed' }
+          Start-Process "$dir\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' | Out-Null
+          for ($i = 0; $i -lt 40 -and (Test-Path "$dir\SerialMonitor.exe"); $i++) { Start-Sleep 1 }
+          if (Test-Path "$dir\SerialMonitor.exe") { throw 'uninstall left files behind' }
+          "Installer lifecycle OK (install, run, uninstall)"
+      - name: Checksums, SBOM and signature status
+        shell: pwsh
+        run: |
+          python -m pip freeze | Set-Content dist\requirements-lock.txt
+          Get-ChildItem dist\SerialMonitor-Setup-*.exe, dist\SerialMonitor-*-portable.zip | ForEach-Object { "$((Get-FileHash $_ -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } | Set-Content dist\SHA256SUMS.txt
+          Get-Content dist\SHA256SUMS.txt
+          $sig = Get-AuthenticodeSignature (Get-ChildItem dist\SerialMonitor-Setup-*.exe).FullName
+          $lines = @('### Build summary', '', "- GUI smoke test: ${{ steps.gui.outcome }}", "- Authenticode signature: $($sig.Status) (unsigned until you add a code-signing certificate)", '', '```', (Get-Content dist\SHA256SUMS.txt), '```')
+          $lines | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+      - name: Upload installer (.exe)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SerialMonitor-Setup
+          path: dist/SerialMonitor-Setup-*.exe
+          if-no-files-found: error
+      - name: Upload portable zip + checksums + SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: SerialMonitor-Portable
+          path: |
+            dist/SerialMonitor-*-portable.zip
+            dist/SHA256SUMS.txt
+            dist/requirements-lock.txt
+          if-no-files-found: error
+      - name: Publish as GitHub Release (direct download)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('build-{0}', github.run_number) }}
+          target_commitish: ${{ github.sha }}
+          name: Serial Monitor ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('build {0}', github.run_number) }}
+          files: |
+            dist/SerialMonitor-Setup-*.exe
+            dist/SerialMonitor-*-portable.zip
+            dist/SHA256SUMS.txt
+            dist/requirements-lock.txt
